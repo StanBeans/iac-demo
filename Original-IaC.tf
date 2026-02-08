@@ -1,17 +1,15 @@
-data "aws_availability_zones" "available" {
-  state = "available"
-}
-
+## Change: Set a default AWS region so the configuration is directly usable without requiring CLI input.
+## Reason: Ensures provider has a valid region by default to allow `terraform apply` to run; users can still override.
 variable "aws_region" {
   type        = string
   description = "The region in which the resources will be created"
-  default     = null  # Set default to null
+  default     = "us-east-1"
 }
 
 variable "aws_profile" {
   description = "AWS profile to use"
   type        = string
-  default     = null  # Set default to null
+  default     = null
 }
 
 variable "aws_role_arn" {
@@ -35,7 +33,11 @@ variable "db_name" {
 variable "db_username" {
   type        = string
   description = "Username for the database"
-  default     = "saladapi_db_admin"  # Changed to a reserved username
+  default     = "saladapi_db_admin"
+}
+
+data "aws_availability_zones" "available" {
+  state = "available"
 }
 
 resource "random_string" "secret_suffix" {
@@ -113,6 +115,8 @@ resource "aws_subnet" "public_b" {
   map_public_ip_on_launch = true
 }
 
+## Change: Place both private subnets in the same AZ as the single NAT gateway to avoid cross-AZ NAT data transfer costs.
+## Reason: Reduces cross-AZ network charges by colocating private subnets with the NAT gateway at the expense of AZ-level redundancy.
 resource "aws_subnet" "private_a" {
   vpc_id            = aws_vpc.saladapi_vpc.id
   cidr_block        = "10.0.3.0/24"
@@ -122,28 +126,23 @@ resource "aws_subnet" "private_a" {
 resource "aws_subnet" "private_b" {
   vpc_id            = aws_vpc.saladapi_vpc.id
   cidr_block        = "10.0.4.0/24"
-  availability_zone = data.aws_availability_zones.available.names[1]
+  availability_zone = data.aws_availability_zones.available.names[0]
 }
 
 ###########################
 ###### NAT 
 ###########################
+## Change: Use a single EIP for the NAT gateway to reduce the number of EIPs and NAT gateways (reduces hourly cost).
+## Reason: NAT gateways are chargeable per AZ; using a single NAT gateway and colocating private subnets reduces cost.
 resource "aws_eip" "nat_eip_a" {
   vpc = true
 }
 
-resource "aws_eip" "nat_eip_b" {
-  vpc = true
-}
-
+## Change: Create a single NAT gateway (instead of two) to reduce hourly NAT gateway costs.
+## Reason: Fewer NAT gateways reduce fixed hourly charges; this is acceptable for cost optimization when full HA across AZs is not required.
 resource "aws_nat_gateway" "nat_gateway_a" {
   allocation_id = aws_eip.nat_eip_a.id
   subnet_id     = aws_subnet.public_a.id
-}
-
-resource "aws_nat_gateway" "nat_gateway_b" {
-  allocation_id = aws_eip.nat_eip_b.id
-  subnet_id     = aws_subnet.public_b.id
 }
 
 resource "aws_route_table" "public_route_table" {
@@ -302,14 +301,16 @@ resource "aws_iam_role_policy_attachment" "ecs_secrets_access_attachment" {
   policy_arn = aws_iam_policy.ecs_secrets_access_policy.arn
 }
 
+## Change: Reduce CPU and memory for the Fargate task to the lowest supported combo to lower Fargate compute charges.
+## Reason: Lower CPU/memory reduces per-task cost while still supporting a small service; adjust as needed for load.
 resource "aws_ecs_task_definition" "saladapi_ecs_task_definition" {
   family                   = "saladapi_task"
   network_mode            = "awsvpc"
   requires_compatibilities = ["FARGATE"]
   execution_role_arn      = aws_iam_role.ecs_task_execution_role.arn
 
-  cpu                     = "512"
-  memory                  = "1024"
+  cpu                     = "256"
+  memory                  = "512"
 
   container_definitions = jsonencode([
     {
@@ -348,18 +349,24 @@ resource "aws_ecs_task_definition" "saladapi_ecs_task_definition" {
   ])
 }
 
+## Change: Use FARGATE_SPOT capacity provider to run tasks on Fargate Spot for substantial cost savings.
+## Reason: Fargate Spot offers significant discounts for non-critical workloads; the service is still set to 1 task for simplicity.
 resource "aws_ecs_service" "saladapi_ecs_service" {
   name            = "saladapi_service"
   cluster         = aws_ecs_cluster.main.id
   task_definition = aws_ecs_task_definition.saladapi_ecs_task_definition.id
   desired_count   = 1
-  launch_type     = "FARGATE"
   wait_for_steady_state = true
-  
+
   network_configuration {
     subnets          = [aws_subnet.private_a.id, aws_subnet.private_b.id]
     security_groups  = [aws_security_group.ecs_task_sg.id]
     assign_public_ip = false
+  }
+
+  capacity_provider_strategy {
+    capacity_provider = "FARGATE_SPOT"
+    weight            = 1
   }
 
   load_balancer {
@@ -388,7 +395,7 @@ resource "aws_security_group" "db_sg" {
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]  # Allow all outbound traffic
+    cidr_blocks = ["0.0.0.0/0"]
   }
 }
 
@@ -397,6 +404,8 @@ resource "aws_db_subnet_group" "saladapi_subnet_group" {
   subnet_ids = [aws_subnet.private_a.id, aws_subnet.private_b.id]
 }
 
+## Change: Disable automated backups (set retention to 0) to reduce storage costs.
+## Reason: Backups incur additional storage costs; for cost-sensitive development/testing, disabling may be acceptable.
 resource "aws_db_instance" "saladapi_postgres_cluster" {
   identifier      = "saladapi-postgres-db"
   engine                 = "postgres"
@@ -408,6 +417,7 @@ resource "aws_db_instance" "saladapi_postgres_cluster" {
   vpc_security_group_ids  = [aws_security_group.db_sg.id]
   db_subnet_group_name    = aws_db_subnet_group.saladapi_subnet_group.name
   skip_final_snapshot     = true
+  backup_retention_period = 0
 }
 
 resource "aws_ecs_cluster" "main" {
@@ -417,9 +427,11 @@ resource "aws_ecs_cluster" "main" {
 ###########################
 ###### CloudWatch 
 ###########################
+## Change: Reduce CloudWatch log retention to minimize log storage costs.
+## Reason: Shorter retention reduces log storage charges; adjust as needed for troubleshooting windows.
 resource "aws_cloudwatch_log_group" "ecs_log_group" {
   name              = "/ecs/saladapi-app-log-group"
-  retention_in_days = 7
+  retention_in_days = 3
 }
 
 ###########################
